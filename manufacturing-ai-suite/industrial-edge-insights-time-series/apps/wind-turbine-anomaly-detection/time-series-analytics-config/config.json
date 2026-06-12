@@ -1,7 +1,7 @@
 {
     "udfs": {
         "name": "windturbine_anomaly_detector",
-        "models": "windturbine_anomaly_detector.pkl",
+        "models": "rf_model.pkl",
         "device": "CPU"
     },
     "alerts": {

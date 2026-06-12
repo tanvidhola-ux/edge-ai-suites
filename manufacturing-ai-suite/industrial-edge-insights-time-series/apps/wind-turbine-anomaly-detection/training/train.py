@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
+'''
 try:
     from sklearnex import config_context, patch_sklearn
 except ImportError as exc:
@@ -22,7 +22,7 @@ except ImportError as exc:
         "scikit-learn-intelex is required. Install with: pip install scikit-learn-intelex"
     ) from exc
 
-patch_sklearn()
+patch_sklearn()'''
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -141,6 +141,7 @@ def main() -> None:
         pickle.dump(model, f)
 
     print(f"Saved model: {args.output_model}")
+    print("Model type:", type(model))
 
 
 if __name__ == "__main__":
