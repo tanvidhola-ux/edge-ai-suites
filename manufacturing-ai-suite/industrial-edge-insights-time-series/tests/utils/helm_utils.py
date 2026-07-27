@@ -13,6 +13,8 @@ import shutil
 import tempfile
 import copy
 import random
+import glob
+import tarfile
 import common_utils
 from common_utils import cross_verify_img_handle_with_s3
 import yaml
@@ -160,6 +162,70 @@ def _build_udf_payload(sample_app, device_value, alert_mode):
     }
     return payload
 
+def _find_chart_tgz(chart_dir):
+    """Return the most recently modified .tgz file directly inside chart_dir, or None."""
+    if not chart_dir or not os.path.isdir(chart_dir):
+        return None
+    tgz_files = glob.glob(os.path.join(chart_dir, "*.tgz"))
+    if not tgz_files:
+        return None
+    return max(tgz_files, key=os.path.getmtime)
+
+
+def _ensure_chart_extracted(chart_dir):
+    """If chart_dir doesn't already contain Chart.yaml directly, find a packaged
+    .tgz inside it and extract its contents into chart_dir itself, so legacy
+    code that reads chart_path/values.yaml directly keeps working.
+
+    Idempotent: writes a `.extracted_from` marker file recording
+    "<tgz basename>:<mtime>" so repeated calls don't re-extract unnecessarily.
+    """
+    if not chart_dir or not os.path.isdir(chart_dir):
+        return chart_dir
+
+    if os.path.isfile(os.path.join(chart_dir, "Chart.yaml")):
+        return chart_dir
+
+    tgz_path = _find_chart_tgz(chart_dir)
+    if not tgz_path:
+        return chart_dir
+
+    marker_path = os.path.join(chart_dir, ".extracted_from")
+    signature = f"{os.path.basename(tgz_path)}:{os.path.getmtime(tgz_path)}"
+    if os.path.isfile(marker_path):
+        try:
+            with open(marker_path, "r") as f:
+                if f.read().strip() == signature:
+                    return chart_dir
+        except OSError:
+            pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with tarfile.open(tgz_path, "r:gz") as tar:
+                tar.extractall(tmp_dir)
+            # The tgz contains a single top-level chart directory; copy its
+            # contents into chart_dir itself.
+            entries = os.listdir(tmp_dir)
+            if entries:
+                extracted_root = os.path.join(tmp_dir, entries[0])
+                if os.path.isdir(extracted_root):
+                    for item in os.listdir(extracted_root):
+                        src = os.path.join(extracted_root, item)
+                        dst = os.path.join(chart_dir, item)
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(src, dst)
+        with open(marker_path, "w") as f:
+            f.write(signature)
+        logger.info(f"Extracted Helm chart package {tgz_path} into {chart_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to extract Helm chart package {tgz_path}: {e}")
+
+    return chart_dir
+
+
 def _resolve_chart_path(raw_path):
     """Return an absolute chart path regardless of current working directory."""
     if not raw_path:
@@ -167,11 +233,11 @@ def _resolve_chart_path(raw_path):
 
     expanded_path = os.path.expandvars(raw_path)
     if os.path.isabs(expanded_path):
-        return os.path.normpath(expanded_path)
+        return _ensure_chart_extracted(os.path.normpath(expanded_path))
 
     # pytest.ini paths are authored relative to tests/functional
     normalized_path = os.path.abspath(os.path.join(FUNCTIONAL_TESTS_DIR, expanded_path))
-    return os.path.normpath(normalized_path)
+    return _ensure_chart_extracted(os.path.normpath(normalized_path))
 
 def get_env_values():
     """Load configuration and extract Helm-related values."""
@@ -194,12 +260,12 @@ def _resolve_chart_path_from_cwd(raw_path):
         return raw_path
     expanded = os.path.expandvars(raw_path)
     if os.path.isabs(expanded) and os.path.exists(expanded):
-        return expanded
+        return _ensure_chart_extracted(expanded)
     resolved = os.path.normpath(os.path.join(os.getcwd(), expanded))
     if os.path.exists(resolved):
-        return resolved
+        return _ensure_chart_extracted(resolved)
     # Fall back to the repo-root strategy as a last resort
-    return _resolve_path_under_repo(raw_path)
+    return _ensure_chart_extracted(_resolve_path_under_repo(raw_path))
 
 
 def get_multimodal_env_values():
@@ -1562,8 +1628,13 @@ def generate_helm_chart_targz(chart_path, sample_app=constants.WIND_SAMPLE_APP):
     For multimodal, uses `make gen_helm_charts` + manual packaging since
     multimodal Makefile doesn't have gen_helm_charts_targz target.
     """
+    if _find_chart_tgz(chart_path):
+        logger.info(f"Found existing Helm chart package in {chart_path}, skipping regeneration")
+        return True
+
     original_dir = os.getcwd()
     try:
+        os.makedirs(chart_path, exist_ok=True)
         os.chdir(chart_path)
         os.chdir("../")
         list_directory_contents()
@@ -1599,6 +1670,7 @@ def generate_helm_chart_targz(chart_path, sample_app=constants.WIND_SAMPLE_APP):
         logger.info("Helm chart generated and packaged successfully.")
         list_directory_contents()
 
+        _ensure_chart_extracted(chart_path)
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to generate Helm chart targz: {e.stderr}")
@@ -1611,9 +1683,13 @@ def generate_helm_chart_targz(chart_path, sample_app=constants.WIND_SAMPLE_APP):
 def helm_install(release_name, chart_path, namespace, telegraf_input_plugin, continuous_simulator_ingestion="True", val="false", sample_app=None):
     """Install a Helm chart with specified parameters."""
     try:
+        install_target = _find_chart_tgz(chart_path) or chart_path
+        if install_target != chart_path:
+            logger.info(f"Installing from packaged chart archive: {install_target}")
+
         # Construct the Helm install command
         helm_command = [
-            "helm", "install", release_name, chart_path,
+            "helm", "install", release_name, install_target,
             "--set", f"env.privileged_access_required={val}",
             "--set", f"env.TELEGRAF_INPUT_PLUGIN={telegraf_input_plugin}",
             "--set", f"env.CONTINUOUS_SIMULATOR_INGESTION={continuous_simulator_ingestion}",
@@ -1663,9 +1739,13 @@ def helm_uninstall(release_name, namespace):
 def helm_upgrade(release_name, chart_path, namespace, telegraf_input_plugin1):
     """Upgrade a Helm release with specified parameters."""
     try:
+        install_target = _find_chart_tgz(chart_path) or chart_path
+        if install_target != chart_path:
+            logger.info(f"Upgrading from packaged chart archive: {install_target}")
+
         # Construct the Helm upgrade command
         helm_command = [
-            "helm", "upgrade", release_name, chart_path,
+            "helm", "upgrade", release_name, install_target,
             "--set", f"env.TELEGRAF_INPUT_PLUGIN={telegraf_input_plugin1}",
             "-n", namespace
         ]

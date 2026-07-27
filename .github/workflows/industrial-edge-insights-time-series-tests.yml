@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: 'yes'
+      weekly_build_date:
+        description: 'Weekly build date for Docker images (YYYYMMDD) eg: 20260721. Used only when build=no.'
+        required: false
+        type: string
+        default: ''
       tests:
         description: >
           Which tests to run. Use 'all-tests', 'timeseries-all', 'timeseries-functional', or 'multimodal-all' to run a group,
@@ -71,6 +76,11 @@ on:
         required: false
         type: string
         default: 'yes'
+      weekly_build_date:
+        description: 'Weekly build date for Docker images (YYYYMMDD) eg: 20260721. Used only when build=no.'
+        required: false
+        type: string
+        default: ''
       tests:
         description: >
           Which tests to run. Use 'all-tests', 'timeseries-all', 'timeseries-functional', or 'multimodal-all' to run a group,
@@ -138,6 +148,20 @@ jobs:
           echo "tests           : $TESTS"
           echo "include_gpu_tests: $INCLUDE_GPU_TESTS"
           echo "skip_long_tests : $SKIP_LONG_TESTS"
+          # Normalize build value (trim whitespace) so all downstream if: conditions work correctly
+          BUILD_NORMALIZED="$(echo "$BUILD" | xargs)"
+          echo "BUILD_NORMALIZED=${BUILD_NORMALIZED}" >> "$GITHUB_ENV"
+
+      - name: Validate weekly_build_date input usage
+        env:
+          WEEKLY_BUILD_DATE_INPUT: ${{ inputs.weekly_build_date || '' }}
+        run: |
+          # BUILD_NORMALIZED is set by the previous step (whitespace-trimmed)
+          if [[ -n "$WEEKLY_BUILD_DATE_INPUT" && "$BUILD_NORMALIZED" != "no" ]]; then
+            echo "Error: 'weekly_build_date' is only supported when build=no."
+            echo "Current values: build=$BUILD_NORM, weekly_build_date=$WEEKLY_BUILD_DATE_INPUT"
+            exit 1
+          fi
 
       - name: Checkout edge-ai-suites repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -146,8 +170,57 @@ jobs:
           ref: ${{ inputs.suites_ref || inputs.tag || github.ref }}
           persist-credentials: false
 
+      - name: Determine required Helm chart artifacts
+        env:
+          TESTS: ${{ inputs.tests || env.DEFAULT_TESTS }}
+        run: |
+          cd "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/"
+
+          HAS_WIND_APP=false
+          if [[ -d "apps/wind-turbine-anomaly-detection" ]]; then
+            HAS_WIND_APP=true
+          fi
+
+          # Test files/groups that require the Time Series (wind-turbine) or Multimodal Helm chart
+          TS_HELM_TESTS="test_helm_deployment_wind_turbine test_helm_influxdb_retention test_docker_helm_deployment_security test_GPU_helm"
+          MM_HELM_TESTS="test_helm_deployment_multimodal test_GPU_helm_multimodal test_NPU_helm_multimodal"
+
+          NEED_TS_HELM=false
+          NEED_MM_HELM=false
+
+          # Parse comma-separated test input once, shared by both the
+          # generate (build=yes) and pull (build=no) Helm chart steps.
+          IFS=',' read -ra SELECTED <<< "$TESTS"
+          for t in "${SELECTED[@]}"; do
+            t="$(echo "$t" | xargs)"  # trim whitespace
+            [[ -z "$t" ]] && continue
+            # Extract base test file name (strip .py suffix and anything after ::)
+            test_file="${t%%::*}"
+            test_file="${test_file%.py}"
+
+            if [[ "$t" == "all-tests" || "$t" == "timeseries-all" || "$t" == "timeseries-functional" ]]; then
+              if [[ "$HAS_WIND_APP" == "true" ]]; then
+                NEED_TS_HELM=true
+              fi
+            fi
+
+            if [[ "$t" == "all-tests" || "$t" == "multimodal-all" ]]; then
+              NEED_MM_HELM=true
+            fi
+
+            if echo "$TS_HELM_TESTS" | grep -qw "$test_file"; then NEED_TS_HELM=true; fi
+            if echo "$MM_HELM_TESTS" | grep -qw "$test_file"; then NEED_MM_HELM=true; fi
+          done
+
+          echo "NEED_TS_HELM=$NEED_TS_HELM" >> "$GITHUB_ENV"
+          echo "NEED_MM_HELM=$NEED_MM_HELM" >> "$GITHUB_ENV"
+
+          echo "Helm chart requirements based on selected tests ($TESTS):"
+          echo "  Time Series (wind-turbine) chart needed: $NEED_TS_HELM"
+          echo "  Multimodal chart needed: $NEED_MM_HELM"
+
       - name: Resolve edge-ai-libraries ref
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
@@ -162,7 +235,7 @@ jobs:
           echo "EDGE_AI_LIBRARIES_REF=$LIBRARIES_REF" >> "$GITHUB_ENV"
 
       - name: Checkout Time Series Analytics microservice (edge-ai-libraries)
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: open-edge-platform/edge-ai-libraries
@@ -170,84 +243,170 @@ jobs:
           path: edge-ai-libraries
           persist-credentials: false
 
+      - name: Update WEEKLY_BUILD_DATE in .env and Helm values files
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'no' }}
+        env:
+          WEEKLY_BUILD_DATE_INPUT: ${{ inputs.weekly_build_date || '' }}
+        run: |
+          if [[ -z "$WEEKLY_BUILD_DATE_INPUT" ]]; then
+            echo "weekly_build_date input is empty; skipping .env and Helm values update"
+            exit 0
+          fi
+
+          # Update WEEKLY_BUILD_DATE in a docker .env file
+          update_env_file() {
+            local env_file="$1"
+            if [[ ! -f "$env_file" ]]; then
+              echo "Skipping missing .env file: $env_file"
+              return
+            fi
+            if grep -q '^WEEKLY_BUILD_DATE=' "$env_file"; then
+              sed -i "s|^WEEKLY_BUILD_DATE=.*|WEEKLY_BUILD_DATE=${WEEKLY_BUILD_DATE_INPUT}|" "$env_file"
+            else
+              echo "WEEKLY_BUILD_DATE=${WEEKLY_BUILD_DATE_INPUT}" >> "$env_file"
+            fi
+            echo "Updated WEEKLY_BUILD_DATE in $env_file"
+          }
+
+          # Update weekly_build_date in a Helm values.yaml file
+          update_helm_values() {
+            local values_file="$1"
+            if [[ ! -f "$values_file" ]]; then
+              echo "Skipping missing Helm values file: $values_file"
+              return
+            fi
+            sed -i "s/weekly_build_date: .*/weekly_build_date: \"${WEEKLY_BUILD_DATE_INPUT}\"/" "$values_file"
+            echo "Updated weekly_build_date in $values_file"
+          }
+
+          # Docker .env files
+          update_env_file "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/.env"
+          update_env_file "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/.env"
+
+          # Helm values.yaml files
+          update_helm_values "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/helm/values.yaml"
+          update_helm_values "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/helm/values.yaml"
+
       - name: Building Time Series Analytics microservices
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           cd ./edge-ai-libraries/microservices/time-series-analytics/docker
           docker compose down -v
           docker compose build
 
       - name: Building Multimodal Sample App images
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           cd "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/"
           make down
           make build
 
       - name: Generate Helm charts for Multimodal Sample App
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           cd "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/"
           echo "Generating Helm charts for multimodal..."
           make gen_helm_charts
 
       - name: Building Time Series Sample App images
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           cd "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/"
           make down
           make build
 
       - name: Generate Helm charts for Time Series Sample Apps
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
-        env:
-          TESTS: ${{ inputs.tests || env.DEFAULT_TESTS }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           cd "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/"
 
-          HAS_WIND_APP=false
-          if [[ -d "apps/wind-turbine-anomaly-detection" ]]; then
-            HAS_WIND_APP=true
-          fi
-
-          # Determine which sample apps need helm charts based on selected tests
-          # Only generate for Helm tests, not Docker tests
-          WIND_HELM_TESTS="test_helm_deployment_wind_turbine test_helm_influxdb_retention test_docker_helm_deployment_security test_GPU_helm"
-
-          GENERATE_WIND=false
-
-          # Parse comma-separated test input
-          IFS=',' read -ra SELECTED <<< "$TESTS"
-          for t in "${SELECTED[@]}"; do
-            t="$(echo "$t" | xargs)"  # trim whitespace
-            # Extract base test file name (strip .py suffix and anything after ::)
-            # Handles: test_helm_deployment_wind_turbine, test_helm_deployment_wind_turbine.py,
-            # and test_helm_deployment_wind_turbine::test_gen_chart
-            test_file="${t%%::*}"
-            test_file="${test_file%.py}"
-
-            # Check if it's a wildcard selector (generate all helm charts)
-            if [[ "$t" == "all-tests" || "$t" == "timeseries-all" || "$t" == "timeseries-functional" ]]; then
-              if [[ "$HAS_WIND_APP" == "true" ]]; then
-                GENERATE_WIND=true
-              fi
-              break
-            fi
-
-            # Check if test is wind helm-related
-            if echo "$WIND_HELM_TESTS" | grep -qw "$test_file"; then
-              GENERATE_WIND=true
-            fi
-          done
-
-          # Generate helm charts only for the helm tests being run
-          if [[ "$GENERATE_WIND" == "true" ]]; then
+          if [[ "${{ env.NEED_TS_HELM }}" == "true" ]]; then
             echo "Generating Helm chart package for wind-turbine-anomaly-detection..."
             make gen_helm_charts_targz app=wind-turbine-anomaly-detection
+          else
+            echo "No helm tests selected, skipping helm chart generation"
           fi
 
-          if [[ "$GENERATE_WIND" == "false" ]]; then
-            echo "No helm tests selected, skipping helm chart generation"
+      - name: Pull Helm charts from OCI registry
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'no' }}
+        env:
+          WEEKLY_BUILD_DATE_INPUT: ${{ inputs.weekly_build_date || '' }}
+        run: |
+          # Pull a chart .tgz, then patch weekly_build_date inside it and repack.
+          # The published chart has weekly_build_date: "" so we must inject the
+          # value before tests run, since helm install reads values from the .tgz.
+          pull_and_patch_chart() {
+            local oci_ref="$1"
+            local chart_version="$2"
+            local dest_dir="$3"
+
+            mkdir -p "$dest_dir"
+            echo "Pulling $oci_ref:$chart_version ..."
+            helm pull "$oci_ref" --version "$chart_version" --destination "$dest_dir"
+
+            if [[ -z "$WEEKLY_BUILD_DATE_INPUT" ]]; then
+              echo "No weekly_build_date provided; skipping patch"
+              return
+            fi
+
+            local tgz
+            tgz=$(ls "$dest_dir"/*.tgz | tail -1)
+            echo "Patching weekly_build_date=$WEEKLY_BUILD_DATE_INPUT in $tgz ..."
+
+            local tmp_dir
+            tmp_dir=$(mktemp -d)
+            tar -xzf "$tgz" -C "$tmp_dir"
+
+            # # Patch values.yaml inside the extracted chart directory
+            # find "$tmp_dir" -maxdepth 2 -name values.yaml | while read vf; do
+            #   sed -i "s/weekly_build_date: .*/weekly_build_date: \"${WEEKLY_BUILD_DATE_INPUT}\"/" "$vf"
+            #   echo "  Patched weekly_build_date in $vf"
+            # done
+
+            # Repackage into the same helm-packages directory
+            rm -f "$tgz"
+            helm package "$tmp_dir"/*/  --destination "$dest_dir"
+            rm -rf "$tmp_dir"
+            echo "Repacked chart: $(ls "$dest_dir"/*.tgz)"
+
+            # Verify
+            echo "Verifying weekly_build_date inside repacked chart:"
+            tar -xOf "$(ls "$dest_dir"/*.tgz | tail -1)" --wildcards "*/values.yaml" \
+              | grep 'weekly_build_date'
+          }
+
+          if [[ "${{ env.NEED_TS_HELM }}" == "true" ]]; then
+            TS_IMAGE_SUFFIX=$(grep 'image_suffix:' \
+              "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/helm/values.yaml" \
+              | head -1 | awk -F'"' '{print $2}')
+            TS_CHART_VERSION="${TS_IMAGE_SUFFIX}-${WEEKLY_BUILD_DATE_INPUT}-weekly"
+            echo "Time Series Helm chart pull:"
+            echo "  image_suffix: $TS_IMAGE_SUFFIX"
+            echo "  Chart version: $TS_CHART_VERSION"
+            [[ -n "$WEEKLY_BUILD_DATE_INPUT" ]] && echo "  Weekly build date: $WEEKLY_BUILD_DATE_INPUT"
+            pull_and_patch_chart \
+              "oci://registry-1.docker.io/intel/wind-turbine-anomaly-detection-sample-app" \
+              "$TS_CHART_VERSION" \
+              "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-time-series/helm-packages"
+          else
+            echo "No Time Series Helm tests selected, skipping Time Series chart pull"
+          fi
+
+          if [[ "${{ env.NEED_MM_HELM }}" == "true" ]]; then
+            MM_IMAGE_SUFFIX=$(grep 'image_suffix:' \
+              "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/helm/values.yaml" \
+              | head -1 | awk -F'"' '{print $2}')
+            MM_CHART_VERSION="${MM_IMAGE_SUFFIX}-${WEEKLY_BUILD_DATE_INPUT}-weekly"
+            echo "Multimodal Helm chart pull:"
+            echo "  image_suffix: $MM_IMAGE_SUFFIX"
+            echo "  Chart version: $MM_CHART_VERSION"
+            [[ -n "$WEEKLY_BUILD_DATE_INPUT" ]] && echo "  Weekly build date: $WEEKLY_BUILD_DATE_INPUT"
+            pull_and_patch_chart \
+              "oci://registry-1.docker.io/intel/multimodal-weld-defect-detection-sample-app" \
+              "$MM_CHART_VERSION" \
+              "${{ github.workspace }}/manufacturing-ai-suite/industrial-edge-insights-multimodal/helm-packages"
+          else
+            echo "No Multimodal Helm tests selected, skipping Multimodal chart pull"
           fi
 
       - name: Install nmap
@@ -262,7 +421,7 @@ jobs:
           test -r "$KUBECONFIG"
 
       - name: Load images into k3s
-        if: ${{ inputs.build != 'no' || (inputs.tag || 'main') == 'main' }}
+        if: ${{ (env.BUILD_NORMALIZED || 'yes') == 'yes' }}
         run: |
           echo "Loading docker images into k3s..."
           docker images --format "{{.Repository}}:{{.Tag}}" | grep "^intel/ia-" | grep -v "<none>" | while read image; do
@@ -324,6 +483,7 @@ jobs:
           TESTS: ${{ inputs.tests || env.DEFAULT_TESTS }}
           INCLUDE_GPU_TESTS: ${{ inputs.include_gpu_tests || 'no' }}
           SKIP_LONG_TESTS: ${{ inputs.skip_long_tests || 'yes' }}
+          WEEKLY_BUILD_DATE_INPUT: ${{ inputs.weekly_build_date || '' }}
         run: |
           # Core time-series test files excluding security.
           TIMESERIES_CORE_TESTS="test_docker_deployment_stability \
@@ -390,13 +550,22 @@ jobs:
             )
           fi
 
+          # For weekly builds, skip KPI/chart-generation tests that are not applicable.
+          WEEKLY_EXCLUDE_ARGS=()
+          if [[ -n "$WEEKLY_BUILD_DATE_INPUT" ]]; then
+            echo "weekly_build_date is set (${WEEKLY_BUILD_DATE_INPUT}); excluding image-build and chart-generation tests (not applicable for weekly builds)"
+            WEEKLY_EXCLUDE_ARGS=(
+              -k "not test_container_sizes_kpi and not test_build_time_kpi and not test_gen_chart"
+            )
+          fi
+
           # List tests that will be collected (helps debug which tests run/are skipped)
           echo ""
           echo "========== Collecting time-series core tests =========="
           if [[ "$RUN_ALL_TS" == "true" ]]; then
-            pytest --collect-only -q "${MARKER_ARGS[@]}" "${IGNORE_ARGS[@]}" 2>&1 || true
+            pytest --collect-only -q "${MARKER_ARGS[@]}" "${WEEKLY_EXCLUDE_ARGS[@]}" "${IGNORE_ARGS[@]}" 2>&1 || true
           else
-            pytest --collect-only -q "${MARKER_ARGS[@]}" "${TS_CORE_TEST_FILES[@]}" 2>&1 || true
+            pytest --collect-only -q "${MARKER_ARGS[@]}" "${WEEKLY_EXCLUDE_ARGS[@]}" "${TS_CORE_TEST_FILES[@]}" 2>&1 || true
           fi
           echo "======================================"
           echo ""
@@ -405,11 +574,11 @@ jobs:
           set +e
           if [[ "$RUN_ALL_TS" == "true" ]]; then
             pytest -vv --tb=short --self-contained-html --html=/tmp/test_timeseries_core_report/report.html \
-              --junitxml=/tmp/test_timeseries_core_report/junit.xml "${MARKER_ARGS[@]}" "${IGNORE_ARGS[@]}" \
+              --junitxml=/tmp/test_timeseries_core_report/junit.xml "${MARKER_ARGS[@]}" "${WEEKLY_EXCLUDE_ARGS[@]}" "${IGNORE_ARGS[@]}" \
               --ignore=test_docker_helm_deployment_security.py
           else
             pytest -vv --tb=short --self-contained-html --html=/tmp/test_timeseries_core_report/report.html \
-              --junitxml=/tmp/test_timeseries_core_report/junit.xml "${MARKER_ARGS[@]}" "${TS_CORE_TEST_FILES[@]}"
+              --junitxml=/tmp/test_timeseries_core_report/junit.xml "${MARKER_ARGS[@]}" "${WEEKLY_EXCLUDE_ARGS[@]}" "${TS_CORE_TEST_FILES[@]}"
           fi
           PYTEST_RC=$?
           set -e
